@@ -1,0 +1,130 @@
+name: Sync Agency Agents to Paperclip Droplet
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "**/*.md"
+      - "!README*.md"
+      - "!CONTRIBUTING*.md"
+      - "!SECURITY.md"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Sync Changed Agents to Paperclip API
+        env:
+          PAPERCLIP_API_URL: ${{ secrets.PAPERCLIP_API_URL }}
+          PAPERCLIP_API_KEY: ${{ secrets.PAPERCLIP_API_KEY }}
+          PAPERCLIP_COMPANY_ID: ${{ secrets.PAPERCLIP_COMPANY_ID }}
+        run: |
+          python3 - << 'PYEOF'
+          import os, sys, glob, urllib.request, json, re, subprocess
+
+          api_url = os.environ.get("PAPERCLIP_API_URL", "https://pclip.co/api").rstrip("/")
+          api_key = os.environ.get("PAPERCLIP_API_KEY")
+          company_id = os.environ.get("PAPERCLIP_COMPANY_ID")
+
+          if not api_key or not company_id:
+              print("Missing PAPERCLIP_API_KEY or PAPERCLIP_COMPANY_ID")
+              sys.exit(1)
+
+          req = urllib.request.Request(
+              f"{api_url}/companies/{company_id}/agents",
+              headers={"Authorization": f"Bearer {api_key}"}
+          )
+          with urllib.request.urlopen(req) as resp:
+              pc_agents = json.loads(resp.read().decode())
+
+          pc_by_name = {}
+          for a in pc_agents:
+              name = a.get("name", "").strip().lower()
+              pc_by_name[name] = a["id"]
+              slug = re.sub(r'[^a-z0-9]+', '-', name).strip('-')
+              pc_by_name[slug] = a["id"]
+
+          print(f"Loaded {len(pc_agents)} agents from Paperclip company {company_id}.")
+
+          event_name = os.environ.get("GITHUB_EVENT_NAME")
+          target_files = []
+          if event_name == "workflow_dispatch":
+              for root, _, files in os.walk("."):
+                  if ".git" in root or ".github" in root:
+                      continue
+                  for f in files:
+                      if f.endswith(".md") and not f.startswith(("README", "CONTRIBUTING", "SECURITY")):
+                          target_files.append(os.path.normpath(os.path.join(root, f)))
+          else:
+              try:
+                  diff_output = subprocess.check_output(
+                      ["git", "diff", "--name-only", "HEAD~1", "HEAD"], text=True
+                  )
+                  for line in diff_output.splitlines():
+                      f = line.strip()
+                      if f.endswith(".md") and not f.startswith(("README", "CONTRIBUTING", "SECURITY")):
+                          if os.path.exists(f):
+                              target_files.append(f)
+              except Exception as e:
+                  print(f"Could not get git diff ({e}), scanning all markdown files.")
+                  for root, _, files in os.walk("."):
+                      if ".git" in root or ".github" in root:
+                          continue
+                      for f in files:
+                          if f.endswith(".md") and not f.startswith(("README", "CONTRIBUTING", "SECURITY")):
+                              target_files.append(os.path.normpath(os.path.join(root, f)))
+
+          print(f"Files to inspect: {len(target_files)}")
+          synced = 0
+          for filepath in target_files:
+              with open(filepath, "r", encoding="utf-8") as f:
+                  f_content = f.read()
+
+              name_match = re.search(r"^#\s+(.+)$", f_content, re.MULTILINE)
+              title = name_match.group(1).strip() if name_match else ""
+              basename = os.path.splitext(os.path.basename(filepath))[0]
+
+              target_id = pc_by_name.get(title.lower()) or pc_by_name.get(basename.lower())
+              if not target_id:
+                  print(f"[-] No matching Paperclip agent for: {filepath} (Title: '{title}')")
+                  continue
+
+              try:
+                  get_req = urllib.request.Request(
+                      f"{api_url}/agents/{target_id}",
+                      headers={"Authorization": f"Bearer {api_key}"}
+                  )
+                  with urllib.request.urlopen(get_req) as resp:
+                      current_data = json.loads(resp.read().decode())
+
+                  payload = json.dumps({"capabilities": f_content}).encode("utf-8")
+                  patch_req = urllib.request.Request(
+                      f"{api_url}/agents/{target_id}",
+                      data=payload,
+                      headers={
+                          "Authorization": f"Bearer {api_key}",
+                          "Content-Type": "application/json"
+                      },
+                      method="PATCH"
+                  )
+                  with urllib.request.urlopen(patch_req) as resp:
+                      if resp.status == 200:
+                          print(f"[+] Synced: '{current_data.get('name')}' ({target_id}) from {filepath}")
+                          synced += 1
+              except Exception as err:
+                  print(f"[!] Error updating {target_id} ({filepath}): {err}")
+
+          print(f"Sync complete. Successfully updated {synced} agents.")
+          PYEOF
